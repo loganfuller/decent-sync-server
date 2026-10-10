@@ -69,9 +69,9 @@ import { rememberSecret, watchLog } from "./secrets.js";
 //   manifest declares `pluginStorage`: it answers a read with a `storageRead`
 //   event of `{ key, value }`, `value` null for a key never written, and a
 //   write with a `storageWrite` event of the data written, each in a later
-//   turn, and never answers a command that fails. Its values belong to a
-//   `PluginStorage`, which outlives the load: give the next load of the same
-//   tablet the same one. Decaid's store API (`/store/{plugin id}`) reads the
+//   turn, and never answers a command that fails; `holdStorageAnswers` holds
+//   the answers. Its values belong to a `PluginStorage`, which outlives the
+//   load: give the next load of the same tablet the same one. Decaid's store API (`/store/{plugin id}`) reads the
 //   same values.
 // - Unloading calls onUnload, then cancels the generation's timers and closes
 //   its transports, dropping their later events.
@@ -337,6 +337,8 @@ export function helloWith(token: string, extra: Record<string, unknown> = {}): R
 export class PluginStorage {
   private values = new Map<string, unknown>();
   private failingReads = 0;
+  /** The key whose reads fail, or undefined for any key's. */
+  private failingKey: string | undefined;
   /** Whether Decaid's store API has opened this storage since Decaid started, which a backup needs. */
   private openedThroughApi = false;
 
@@ -365,9 +367,13 @@ export class PluginStorage {
     this.values = structuredClone(new Map(saved));
   }
 
-  /** Leaves the next `count` reads unanswered, as Decaid leaves one whose read from its store fails. */
-  failNextReads(count: number): void {
+  /**
+   * Leaves the next `count` reads unanswered, or of `key` only, as Decaid
+   * leaves one whose read from its store fails.
+   */
+  failNextReads(count: number, key?: string): void {
     this.failingReads = count;
+    this.failingKey = key;
   }
 
   /** Decaid starts, as each load of the plugin stands for: its store API has opened nothing yet. */
@@ -394,7 +400,7 @@ export class PluginStorage {
     const { type, key, data } = (JSON.parse(JSON.stringify(command ?? null)) ?? {}) as { type?: unknown; key?: unknown; data?: unknown };
     if (typeof key !== "string") return null;
     if (type === "read") {
-      if (this.failingReads > 0) {
+      if (this.failingReads > 0 && (this.failingKey === undefined || this.failingKey === key)) {
         this.failingReads--;
         return null;
       }
@@ -577,6 +583,8 @@ export class SimulatedTablet {
   private unloaded = false;
   /** Whether the server cannot be reached: every open fails. */
   private networkLost = false;
+  /** Answers to storage commands held by `holdStorageAnswers`, until released. */
+  private heldStorageAnswers: { name: string; payload: unknown }[] | undefined;
   /** Connections the plugin was told ended that the server still holds open, until it closes them or the plugin unloads. */
   private readonly unnoticed = new Set<WebSocket>();
   /** Matches the frame after which the next connection to receive one ends, until one does. */
@@ -731,7 +739,24 @@ export class SimulatedTablet {
    */
   private storageCommand(command: unknown): void {
     const answer = this.storage.carryOut(command);
-    if (answer) setImmediate(() => this.fire(answer.name, answer.payload));
+    if (!answer) return;
+    if (this.heldStorageAnswers) this.heldStorageAnswers.push(answer);
+    else setImmediate(() => this.fire(answer.name, answer.payload));
+  }
+
+  /**
+   * Holds Decaid's answers to the plugin's storage commands until the
+   * function returned is called, as a slow Decaid does: each command is
+   * still carried out as it arrives, so a write lands, but the plugin hears
+   * of it only once released, and not at all once unloaded.
+   */
+  holdStorageAnswers(): () => void {
+    const held: { name: string; payload: unknown }[] = [];
+    this.heldStorageAnswers = held;
+    return () => {
+      if (this.heldStorageAnswers === held) this.heldStorageAnswers = undefined;
+      for (const answer of held.splice(0)) setImmediate(() => this.fire(answer.name, answer.payload));
+    };
   }
 
   /** Loses the network: every connection ends without a close handshake, as if the Wi-Fi dropped. */

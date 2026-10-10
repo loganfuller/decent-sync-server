@@ -15,6 +15,7 @@ import {
 import { CollectionCapture } from "./collections.js";
 import { readMachineHardware, readTabletIdentity } from "./decaid.js";
 import type { PluginHost, TransportEvent } from "./host.js";
+import { KeptDeliveries } from "./kept-deliveries.js";
 import { LibraryAccess, LibraryWrites } from "./library-writes.js";
 import { MachineEvents } from "./machine-events.js";
 import { Outbox } from "./outbox.js";
@@ -22,6 +23,7 @@ import { Sender } from "./sender.js";
 import { ShotCapture } from "./shots.js";
 import type { SyncSettings } from "./settings.js";
 import { SteamCapture } from "./steams.js";
+import { PluginStorage } from "./storage.js";
 import { TabletId } from "./tablet-id.js";
 
 const MIN_RECONNECT_MS = 1_000;
@@ -76,7 +78,7 @@ const YIELDING_CLOSES = new Map<number, string>([
   [CLOSE_CODES.machine_held, `Another tablet is still connected with this Machine's token. Trying again in ${YIELD_MS / 1000} s.`],
 ]);
 
-type TimerName = "reconnect" | "heartbeat" | "silence" | "connect" | "hardwarePoll" | "hardwareCooldown" | "sendFailed";
+type TimerName = "restore" | "reconnect" | "heartbeat" | "silence" | "connect" | "hardwarePoll" | "hardwareCooldown" | "sendFailed";
 
 /**
  * The plugin's one connection to the sync server: `hello` on every connect,
@@ -140,7 +142,9 @@ export class SyncConnection {
   private dismissedHardware: MachineHardware | null = null;
   /** Set once another tablet replaced this one, until a `yielding` hello is welcomed. */
   private yielding = false;
-  /** Everything awaiting the server's acknowledgment, kept across reconnects in this runtime. */
+  /** Decaid's plugin storage, where the tablet's id and the outbox's Workflow and machine state events are kept. */
+  private readonly storage: PluginStorage;
+  /** Everything awaiting the server's acknowledgment, kept across reconnects, and its Workflow and machine state events across unloads. */
   private readonly outbox: Outbox;
   private readonly shots: ShotCapture;
   private readonly steams: SteamCapture;
@@ -158,10 +162,15 @@ export class SyncConnection {
     private readonly settings: SyncSettings,
     private readonly log: (message: string) => void,
   ) {
-    this.outbox = new Outbox(log, {
-      shot: (id, deliveryId) => this.shots.read(id, deliveryId),
-      steam: (id, deliveryId) => this.steams.read(id, deliveryId),
-    });
+    this.storage = new PluginStorage(host);
+    this.outbox = new Outbox(
+      log,
+      {
+        shot: (id, deliveryId) => this.shots.read(id, deliveryId),
+        steam: (id, deliveryId) => this.steams.read(id, deliveryId),
+      },
+      new KeptDeliveries(this.storage, log, settings.token),
+    );
     this.shots = new ShotCapture(this.outbox, log);
     this.steams = new SteamCapture(this.outbox, settings.pollSeconds * 1000, log);
     this.machineEvents = new MachineEvents(this.outbox);
@@ -170,11 +179,15 @@ export class SyncConnection {
     this.writes = new LibraryWrites(library, this.outbox, this.machineEvents, () => {
       if (this.sentHardware !== null) this.machineAway = true;
     });
-    this.tabletId = new TabletId(host, log);
+    this.tabletId = new TabletId(this.storage, log);
   }
 
-  /** Connects from a timer, so the caller (onLoad) returns at once. */
+  /**
+   * Reads back the outbox's deliveries kept by earlier loads, and connects,
+   * from timers, so the caller (onLoad) returns at once.
+   */
   start(): void {
+    this.setTimer("restore", 0, () => void this.outbox.restore());
     this.setTimer("reconnect", 0, () => void this.connect());
     this.scheduleHardwarePoll();
     this.steams.start();
@@ -198,7 +211,7 @@ export class SyncConnection {
   shotEvent(type: "shot" | "shotUpdated", payload: unknown): void { this.shots.event(type, payload); }
 
   /** Decaid's answer to a command to its plugin storage. */
-  storageEvent(name: string, payload: unknown): void { this.tabletId.answered(name, payload); }
+  storageEvent(name: string, payload: unknown): void { this.storage.answered(name, payload); }
 
   stop(): void {
     this.stopped = true;
@@ -207,6 +220,8 @@ export class SyncConnection {
     this.steams.stop();
     this.collections.stop();
     this.tabletId.stop();
+    // Sends the writes still waiting their turn, such as of a delivery just acknowledged.
+    this.storage.stop();
     for (const id of this.timers.values()) clearTimeout(id);
     this.timers.clear();
     this.closeHandle();

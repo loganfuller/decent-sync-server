@@ -944,6 +944,35 @@ export function decodePluginMessage(text: string): Decoded<PluginMessage> {
 }
 
 /**
+ * Reads a Workflow or machine state delivery as `decodePluginMessage` does,
+ * for the plugin, which keeps them in Decaid's plugin storage across unloads
+ * and sends only those the server would take.
+ */
+export function decodeMachineEvent(text: string): Decoded<WorkflowDelivery | MachineStateDelivery> {
+  const object = parseObject(text);
+  if (typeof object === "string") return invalid(object);
+  if (object.type !== "workflow" && object.type !== "machineState") return invalid("Not a Workflow or machine state delivery");
+  return checkMachineEvent(object);
+}
+
+/** Checks a Workflow or machine state delivery, by its `type`. */
+function checkMachineEvent(object: Fields & { type: string }): Decoded<WorkflowDelivery | MachineStateDelivery> {
+  if (object.type === "workflow") {
+    return check<WorkflowDelivery>(object, "workflow", (fields) => {
+      fields.id();
+      fields.instant("observedAt");
+      fields.objectField("workflow");
+    });
+  }
+  return check<MachineStateDelivery>(object, "machineState", (fields) => {
+    fields.id();
+    fields.instant("observedAt");
+    fields.string("state", { nonEmpty: true });
+    fields.string("substate", { nonEmpty: true });
+  });
+}
+
+/**
  * A `hello` is checked for its protocol version before anything else, so a
  * plugin too old to send today's `hello` is told it is too old rather than
  * that its message is invalid. A valid `hello` is then checked for its Decaid
@@ -1025,18 +1054,8 @@ function decodeMessage(object: Fields & { type: string }): Decoded<PluginMessage
         fields.array("steams", (value) => isObject(value) && typeof value.id === "string" && value.id !== "", 100);
       });
     case "workflow":
-      return check<WorkflowDelivery>(object, "workflow", (fields) => {
-        fields.id();
-        fields.instant("observedAt");
-        fields.objectField("workflow");
-      });
     case "machineState":
-      return check<MachineStateDelivery>(object, "machineState", (fields) => {
-        fields.id();
-        fields.instant("observedAt");
-        fields.string("state", { nonEmpty: true });
-        fields.string("substate", { nonEmpty: true });
-      });
+      return checkMachineEvent(object);
     case "collection":
       return check<CollectionDelivery>(object, "collection", (fields) => {
         fields.id();

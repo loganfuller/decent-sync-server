@@ -45,10 +45,86 @@ like a Shot's sample times, so it is not used; the validator refuses a time
 without its `Z`. Deliveries go in order, one awaiting acknowledgment at a
 time, and what a connection left unacknowledged is sent again first on the
 next, with the same delivery ids, ahead of the Workflow sent on `welcome`, so
-a reconnect never replaces changes made while disconnected. The outbox is in
-memory: events it holds when the plugin unloads are lost, and milestone 2's
-durable outbox recovers them. A reload sends the current Workflow, and the
-next state update, again.
+a reconnect never replaces changes made while disconnected. A reload sends the
+current Workflow, and the next state update, again.
+
+### Kept across unloads
+
+Ticket [#93](https://github.com/loganfuller/decent-sync/issues/93) makes
+these deliveries survive an unload. The outbox keeps each Workflow and
+machine state delivery in Decaid's plugin storage until the server
+acknowledges it (`plugin/src/kept-deliveries.ts`, through the commands of
+`plugin/src/storage.ts`, which the tablet's id shares):
+
+- **Written before it is sent.** A delivery is written to plugin storage, and
+  the record of what is kept after it, and is sent only once Decaid has
+  answered both, in whichever order they land: a write still waiting its
+  turn takes the data of a later write to the same key, so the queue of
+  writes stays bounded however slow Decaid is. One acknowledged, or replaced
+  as the Workflow sent on the last `welcome` is, is removed from what is
+  kept, its key overwritten by its sequence number alone. Decaid answers each
+  command with an event, one at a time; a write it leaves unanswered for
+  10 s counts as failed, is logged, and the delivery is sent anyway, perhaps
+  kept only in memory. From then on, until Decaid answers anything again,
+  writes are sent without waiting for answers, so a Decaid failing every
+  write holds up no delivery and logs once. As the plugin unloads, it sends
+  the writes still waiting their turn without waiting for answers, the one
+  awaiting an answer again first, as Decaid finishes a retiring generation's
+  writes but drops one it received just before if it handles the unload
+  first; so an acknowledgment that arrives just before an unload is recorded
+  and its delivery not sent again.
+- **Sent first after a reload.** As it loads, before it sends anything, the
+  plugin reads back what earlier loads kept and queues it, oldest first,
+  ahead of everything queued since, such as the Workflow Decaid sends after
+  loading it. Each goes with its original delivery id and `observedAt`, so the
+  server's handling of each delivery once still applies (below), as for a
+  reconnect. Reading them back stops at any read Decaid fails or leaves
+  unanswered, never taking it for nothing kept, logs it, and starts again
+  after 5 s, doubling to at most 5 minutes, until it succeeds. Nothing is
+  sent meanwhile, Shots and collections included, so nothing kept is ever
+  sent after a newer delivery. This rests on Decaid's reads failing all
+  together: it reads the plugin's storage from memory, so a read fails only
+  when its store does, or when it does not answer in 10 s, and a Decaid that
+  cannot read the plugin's storage as the plugin loads cannot read the
+  tablet's id either, without which the plugin does not connect. Workflow
+  and machine state deliveries queued meanwhile, for the time 2,001 reads at
+  most take, or longer while Decaid fails them, are held to the limits
+  below, and kept once the reading back ends: an unload before then loses
+  them. Nothing kept sends nothing extra.
+- **Under the token they were made with.** Deliveries belong to the token's
+  Machine, and the server records each delivery id per Machine, so the key
+  `outbox` also holds a 32-bit hash of the token, never the token. A load
+  with another token, as after a barista enters another Machine's token,
+  which reloads the plugin, sends none of what was kept, logs it, and
+  overwrites it.
+- **Bounded.** Decaid stores no null, so `host.storage` deletes no key, and
+  it keeps a plugin's whole storage in memory. So deliveries are kept in a
+  ring of 2,000 keys, `outbox.0` to `outbox.1999`, reused in turn, each
+  holding one delivery with its sequence number, and the key `outbox` holds
+  the range of sequence numbers kept; a key whose delivery is acknowledged or
+  dropped holds only its sequence number. At most 2,000 deliveries are kept, about
+  a busy day of a Machine's state transitions, and at most 2 Mi characters of
+  their JSON (`MAX_KEPT` and `MAX_KEPT_CHARACTERS`), which a few hundred
+  Workflows reach first. Keeping one more past either drops the oldest, from
+  memory too, unless it has been sent; the plugin logs that it is dropping
+  some once per connection. The server's history then has a gap before the
+  oldest it receives, and the Workflow and state sent on the next `welcome`
+  still bring the current ones. In memory too, the outbox holds no more of
+  them than it keeps, but for one sent and awaiting its acknowledgment, and
+  while it reads back what was kept, those read back as well as those held
+  meanwhile. It holds new Shots and Steam Records by their ids until it sends
+  them (`SHOTS.md`, `STEAM_RECORDS.md`); only Shot edits, one per edit, are
+  held whole, as before.
+- **Not kept.** Shots, Steam Records, their indices and collections keep
+  milestone 1's recovery: every load scans and indexes the tablet's records,
+  the server requests what it lacks, and every `welcome` sends each
+  collection. The answers to the server's Library writes are not kept either
+  (`LIBRARY.md`, How the plugin writes).
+
+Resetting the tablet's Decaid data loses what is kept, as it loses the
+tablet's id. A Decaid backup holds it as it holds the id, and restoring one
+sends again what was kept when it was taken: the server changes nothing for a
+delivery whose id it still has (below).
 
 ## Server
 
@@ -82,16 +158,16 @@ locked, so it waits for no delivery, and instances running it at once delete
 different rows. A failed run is logged and the next tries again. The index on
 `received_at` finds the rows to delete.
 
-Deleting them is safe because a resend comes only from the plugin load that
-sent the delivery, from its in-memory outbox on its next welcomed connection,
-far sooner than 90 days. A resend that comes later anyway is handled as a new
-delivery. Only one delivery awaits acknowledgment at a time, so only that one
-can have been stored without the plugin knowing, and it is sent again ahead
-of anything newer. It is stored only if it differs from the latest event, so
-at worst it puts one stale event after a newer one another tablet's
-mismatched session stored for the same Machine. Milestone 2's durable outbox
-lets a delivery outlive its plugin load, so a resend may come later, but the
-same bound holds.
+Deleting them is safe because a resend comes from the plugin on its next
+welcomed connection, or from its next load, which reads back the deliveries
+kept in plugin storage (above), far sooner than 90 days unless the plugin
+stays unloaded, or the server unreachable, that long, or an old Decaid backup
+is restored. A resend that comes later anyway is handled as a new delivery.
+Only one delivery awaits acknowledgment at a time, so only that one can have
+been stored without the plugin knowing, and it is sent again ahead of
+anything newer. It is stored only if it differs from the latest event, so at
+worst it puts one stale event after a newer one another tablet's mismatched
+session stored for the same Machine.
 
 An event belongs to the session's token's Machine, or for a mismatched
 session, to its reported hardware: the Machine that has it, or else its
@@ -125,7 +201,8 @@ time, which may be wrong or jump; `received_at` is PostgreSQL's.
 Known limits: a state update that arrives on a connection whose `hello`
 reported no machine belongs to the token's Machine, as everything on that
 connection does, until the plugin reconnects with the hardware the machine
-then reports (ADR-0015). Events lost by an unload stay lost until milestone 2.
+then reports (ADR-0015). While the server is unreachable for long, the plugin
+keeps only the newest 2,000 events, up to 2 Mi characters (above).
 
 ## REST API
 
@@ -148,7 +225,9 @@ also shows its current Workflow, loaded every 30 s rather than every 5 s as
 the state is.
 
 `server/test/machine-events.test.ts` covers this through Seam 1, with the
-built plugin and raw frames on two instances sharing PostgreSQL, and
+built plugin and raw frames on two instances sharing PostgreSQL,
+`server/test/durable-outbox.test.ts` the deliveries kept across unloads and
+their bound, and
 `e2e/workflow-and-state.spec.ts` the management interface.
 `server/test/binding-deadlocks.test.ts` races deliveries, collections
 included, against a hello or an Admin binding the Machine's hardware, in

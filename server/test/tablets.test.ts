@@ -107,7 +107,7 @@ describe("Tablets", { timeout: 20_000 }, () => {
       expect(helloTabletIds(tablet)).toEqual([first]);
       expect(tablet.logs.join("\n")).not.toContain("was given");
       // Decaid's backups hold it only once its store API has read the plugin's storage, which the plugin has it do.
-      await expect.poll(() => storage.save()).toEqual(new Map([["tabletId", first]]));
+      await expect.poll(() => storage.save().get("tabletId")).toBe(first);
 
       const reloaded = await api.waitForMachine("Lab", (machine) => machine.online && machine.tablet!.lastSeenAt > firstSeenAt);
       expect(tabletIds(reloaded)).toEqual({ current: first, earlier: [] });
@@ -157,7 +157,7 @@ describe("Tablets", { timeout: 20_000 }, () => {
     });
 
     it("is read again, not made anew, when a read of plugin storage fails", async () => {
-      storage.failNextReads(1);
+      storage.failNextReads(1, "tabletId");
       // 50 times faster: Decaid's unanswered read is given up on after 200 ms, and retried 20 ms later.
       const tablet = loadTablet({ settings: settingsFor(lab), storage, api: labApi(), timeScale: 50 });
       await tablet.waitForLog(/^Connected to /);
@@ -199,7 +199,7 @@ describe("Tablets", { timeout: 20_000 }, () => {
 
     const tabletId = storage.read("tabletId");
     expect(tabletId).toMatch(UUID);
-    await expect.poll(() => storage.save(), { timeout: 10_000 }).toEqual(new Map([["tabletId", tabletId]]));
+    await expect.poll(() => storage.save().get("tabletId"), { timeout: 10_000 }).toBe(tabletId);
     // Two reads failed, and the third, answered, was the last.
     expect(tablet.requests.filter((route) => route === "/store/decent-sync.reaplugin")).toHaveLength(3);
   });

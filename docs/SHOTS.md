@@ -70,9 +70,10 @@ fails is retried after the other requested Shots; a 404 means the tablet
 deleted the record. Shots Decaid imported from the legacy de1app (`de1app-*`
 ids), and Shots whose ids the server cannot store, are never indexed or sent
 (ADR-0004). Deletion
-never removes a server record. The outbox (`plugin/src/outbox.ts`) is in
-memory, and Steam Records and Workflow and machine state events share it
-(`STEAM_RECORDS.md`, `WORKFLOW-AND-STATE.md`); reload reconciliation recovers
+never removes a server record. The outbox (`plugin/src/outbox.ts`) holds
+Shots in memory, and Steam Records and Workflow and machine state events
+share it (`STEAM_RECORDS.md`, `WORKFLOW-AND-STATE.md`); only the last are also
+kept in plugin storage across unloads, and reload reconciliation recovers
 lost Shots and edits.
 A delivery too large for one frame, such as a long filter or tea shot, is sent
 in chunks and acknowledged once (`AI_PROTOCOL_NOTES.md`).

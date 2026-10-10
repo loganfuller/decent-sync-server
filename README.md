@@ -54,6 +54,8 @@ had none of that kind yet. A write a tablet refuses is skipped, and tried
 again once its item changes or the tablet reconnects, while the others go on;
 each Machine's page shows its sharing status: the changes waiting for its
 tablet, the last it applied, and the writes it refused, with Decaid's answer.
+The Workflow changes and machine state transitions a tablet has yet to deliver
+are kept in Decaid's plugin storage, so unloading the plugin loses none.
 Everything else is captured without being written to tablets.
 
 Releases publish the server image and the plugin ZIP, starting with
@@ -310,6 +312,16 @@ the tablet it came from, provided the restore puts the id back: restore before
 installing the plugin, as Decaid's onboarding does, or choose to overwrite
 existing data. Otherwise the tablet keeps the new id it was given, and shows
 up as a new tablet.
+
+The plugin also keeps the Workflow changes and machine state transitions the
+server has not yet acknowledged in Decaid's plugin storage, so disabling the
+plugin, changing its settings or restarting Decaid while the server can't be
+reached loses none of them: the next load sends them first, unless the token
+was changed meanwhile. While the server
+is unreachable for long, it keeps the newest 2,000 of them, up to 2 Mi
+characters, dropping the oldest. Shots and Steam Records need no keeping:
+every load sends the server an index of the tablet's records, and the server
+asks for those it lacks.
 
 A Machine at a Location shares its tablet's beans, bean batches, grinders and
 profiles with that Location's other Machines. The plugin writes to its
